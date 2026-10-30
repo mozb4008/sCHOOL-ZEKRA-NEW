@@ -203,16 +203,52 @@ export async function handler(event) {
       return reply(200, await ownData());
     }
     if (profile.role !== 'teacher') throw new ApiError(403, 'هذه الصفحة متاحة للمعلمة فقط.');
-    const requireAdmin = () => {
-      if (!service) {
-        throw new ApiError(503, 'هذه العملية الإدارية معطّلة مؤقتًا لأن المنصة تعمل بوضع الحماية القياسي (RLS) دون SUPABASE_SERVICE_ROLE_KEY. يمكن للطالبات والمعلمات التسجيل واستعادة كلمة المرور عبر البريد الإلكتروني.');
+    const invokeEdgeAdmin = async payload => {
+      const res = await fetch(`${url}/functions/v1/admin-actions`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(12000),
+        headers: {
+          apikey: anon,
+          Authorization: `Bearer ${cookies.atqin_access}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+      const result = await res.json().catch(() => null);
+      if (!res.ok) {
+        if (res.status === 404 && !result?.error) {
+          throw new ApiError(503, 'الوظيفة السحابية للعمليات الإدارية (admin-actions) غير منشورة بعد في Supabase Edge Functions.');
+        }
+        throw new ApiError(res.status, result?.error || result?.message || 'تعذّر إكمال العملية الإدارية عبر Supabase Edge Functions.');
       }
+      return reply(res.status, result || { ok: true });
+    };
+    const requireAdmin = () => {
       if (/^sb_publishable_/.test(service) || service === anon) {
         throw new ApiError(503, 'إعداد الربط غير صحيح: المتغير SUPABASE_SERVICE_ROLE_KEY يحتوي على المفتاح العام بدل المفتاح السري (service_role أو sb_secret_).');
       }
     };
     if (action === 'manage-teacher' || action === 'list-teachers') {
       if (!canManageTeachers) throw new ApiError(403, 'لا تملكين صلاحية إدارة المعلمات.');
+      if (action === 'manage-teacher') {
+        const email = String(body.email || '').trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !['grant', 'revoke'].includes(body.operation) || typeof body.canManageTeachers !== 'boolean') {
+          throw new ApiError(400, 'تحققي من البريد والصلاحية المطلوبة.');
+        }
+        if (email === user.email?.toLowerCase() || email === ownerEmail) {
+          throw new ApiError(403, 'لا يمكن تعديل صلاحية المسؤول الأساسي أو حسابكِ من هنا.');
+        }
+        if (!isOwner && (body.operation === 'revoke' || body.canManageTeachers)) {
+          throw new ApiError(403, 'هذه الصلاحية متاحة للمسؤول الأساسي فقط. يمكنكِ إضافة معلمات لمتابعة النتائج.');
+        }
+      }
+      if (!service) {
+        return await invokeEdgeAdmin(
+          action === 'list-teachers'
+            ? { action: 'list-teachers' }
+            : { action: 'manage-teacher', email: String(body.email || '').trim().toLowerCase(), operation: body.operation, canManageTeachers: body.canManageTeachers }
+        );
+      }
       requireAdmin();
       const users = [];
       for (let page = 1; ; page++) {
@@ -229,7 +265,6 @@ export async function handler(event) {
         }) });
       }
       const email = String(body.email || '').trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !['grant', 'revoke'].includes(body.operation) || typeof body.canManageTeachers !== 'boolean') throw new ApiError(400, 'تحققي من البريد والصلاحية المطلوبة.');
       const target = users.find(u => u.email?.toLowerCase() === email);
       if (!target || !target.email_confirmed_at) throw new ApiError(400, 'يجب أن تسجّل المعلمة بهذا البريد وتؤكده أولًا، ثم تسجّل الدخول مرة واحدة.');
       if (target.id === user.id || target.email?.toLowerCase() === ownerEmail) throw new ApiError(403, 'لا يمكن تعديل صلاحية المسؤول الأساسي أو حسابكِ من هنا.');
@@ -252,11 +287,14 @@ export async function handler(event) {
       return reply(200, { students: profiles.filter(p => p.role === 'student'), attempts, challenges });
     }
     if (action === 'create-student') {
-      requireAdmin();
       const name = String(body.name || '').trim();
       const code = String(body.code || '').trim().toLowerCase();
       if (name.length < 2 || name.length > 120 || !codePattern.test(code)) throw new ApiError(400, 'أدخلي اسمًا ورمزًا بالإنجليزية من 3 إلى 40 حرفًا يبدأ بحرف.');
       if (typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) throw new ApiError(400, 'كلمة المرور المؤقتة يجب أن تكون 10 أحرف على الأقل.');
+      if (!service) {
+        return await invokeEdgeAdmin({ action: 'create-student', name, code, password: body.password });
+      }
+      requireAdmin();
       const duplicate = await db(`/rest/v1/profiles?code=eq.${encodeURIComponent(code)}&select=id`);
       if (duplicate.length) throw new ApiError(409, 'رمز الطالبة مستخدم مسبقًا.');
       const created = await request('/auth/v1/admin/users', { method: 'POST', admin: true, data: { email: loginEmail(code), password: body.password, email_confirm: true } });
@@ -269,8 +307,11 @@ export async function handler(event) {
       return reply(201, { ok: true });
     }
     if (action === 'reset-password') {
-      requireAdmin();
       if (!uuid(body.studentId) || typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) throw new ApiError(400, 'بيانات استعادة الحساب غير صحيحة.');
+      if (!service) {
+        return await invokeEdgeAdmin({ action: 'reset-password', studentId: body.studentId, password: body.password });
+      }
+      requireAdmin();
       const [student] = await db(`/rest/v1/profiles?id=eq.${body.studentId}&role=eq.student&select=id`);
       if (!student) throw new ApiError(404, 'لم يتم العثور على الطالبة.');
       await request(`/auth/v1/admin/users/${student.id}`, { method: 'PUT', admin: true, data: { password: body.password } });

@@ -7,6 +7,7 @@ import { preTestQuestions, postTestQuestions } from '../src/data/prePostTestData
 import { errorChallengeBank } from '../src/data/errorChallengeData.js';
 import { buildReport, formatPercent, studentsCsv } from '../src/lib/report.js';
 import { parseEmailCallback } from '../src/lib/emailCallback.js';
+import { handleAdminRequest } from '../supabase/functions/admin-actions/index.ts';
 
 const originalFetch = globalThis.fetch;
 const studentId = '11111111-1111-4111-8111-111111111111';
@@ -408,23 +409,198 @@ test('core student and teacher operations work via RLS without SUPABASE_SERVICE_
   assert.ok(calls.every(c => c.headers.apikey === 'test-anon' && c.headers.Authorization === 'Bearer token'));
 });
 
-test('admin operations requiring SERVICE_ROLE_KEY are gracefully disabled with a clear message when key is absent', async () => {
+test('admin operations without SERVICE_ROLE_KEY in Netlify are securely routed to Supabase Edge Function', async () => {
   delete process.env.SUPABASE_SERVICE_ROLE_KEY;
-  upstream = path => {
+  upstream = (path, options) => {
     if (path === '/auth/v1/user') return { id: studentId, email: 'futureoflife025@gmail.com', email_confirmed_at: '2026-10-22' };
     if (path.startsWith('/rest/v1/profiles?')) return [{ ...profile, role: 'teacher' }];
+    if (path === '/functions/v1/admin-actions') {
+      const payload = JSON.parse(options.body);
+      if (payload.action === 'list-teachers') {
+        return { teachers: [{ id: studentId, name: 'أ. ذكرى آل صديق', email: 'futureoflife025@gmail.com', isOwner: true, canManageTeachers: true }] };
+      }
+      if (payload.action === 'create-student') {
+        return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      }
+      return { ok: true };
+    }
     return [];
   };
-  for (const body of [
-    { action: 'create-student', name: 'طالبة', code: 's099', password: 'temporary-pass' },
-    { action: 'reset-password', studentId: otherId, password: 'temporary-pass' },
-    { action: 'list-teachers' },
-    { action: 'manage-teacher', email: 't@example.com', operation: 'grant', canManageTeachers: false }
-  ]) {
-    const res = await handler(event(body));
-    assert.equal(res.statusCode, 503);
-    assert.match(parse(res).error, /معطّلة مؤقتًا|SUPABASE_SERVICE_ROLE_KEY/);
-  }
+
+  const createRes = await handler(event({ action: 'create-student', name: 'طالبة جديدة', code: 's099', password: 'temporary-pass' }));
+  assert.equal(createRes.statusCode, 201);
+  const edgeCreate = calls.find(c => c.path === '/functions/v1/admin-actions');
+  assert.equal(edgeCreate.headers.apikey, 'test-anon');
+  assert.equal(edgeCreate.headers.Authorization, 'Bearer token');
+  assert.deepEqual(edgeCreate.data, { action: 'create-student', name: 'طالبة جديدة', code: 's099', password: 'temporary-pass' });
+
+  calls.length = 0;
+  const resetRes = await handler(event({ action: 'reset-password', studentId: otherId, password: 'temporary-pass' }));
+  assert.equal(resetRes.statusCode, 200);
+  assert.deepEqual(calls.find(c => c.path === '/functions/v1/admin-actions').data, {
+    action: 'reset-password',
+    studentId: otherId,
+    password: 'temporary-pass'
+  });
+
+  calls.length = 0;
+  const listRes = await handler(event({ action: 'list-teachers' }));
+  assert.equal(listRes.statusCode, 200);
+  assert.equal(parse(listRes).teachers.length, 1);
+
+  calls.length = 0;
+  const manageRes = await handler(event({ action: 'manage-teacher', email: 't@example.com', operation: 'grant', canManageTeachers: false }));
+  assert.equal(manageRes.statusCode, 200);
+  assert.deepEqual(calls.find(c => c.path === '/functions/v1/admin-actions').data, {
+    action: 'manage-teacher',
+    email: 't@example.com',
+    operation: 'grant',
+    canManageTeachers: false
+  });
+});
+
+test('Supabase Edge Function admin-actions verifies JWT and teacher role and blocks students or unauthenticated callers', async () => {
+  const edgeEnv = name => ({
+    SUPABASE_URL: 'https://test.supabase.co',
+    SUPABASE_ANON_KEY: 'edge-anon',
+    SUPABASE_SERVICE_ROLE_KEY: 'edge-service-secret',
+    PRIMARY_TEACHER_EMAIL: 'futureoflife025@gmail.com'
+  }[name]);
+
+  // 1. Missing or invalid Authorization header is rejected with 401
+  const noAuth = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'create-student' })
+    }),
+    edgeEnv
+  );
+  assert.equal(noAuth.status, 401);
+
+  // 2. Student calling Edge Function directly is rejected with 403
+  upstream = path => {
+    if (path === '/auth/v1/user') return { id: studentId, email: 'student@example.com', email_confirmed_at: '2026-10-22' };
+    if (path.startsWith('/rest/v1/profiles?')) return [{ ...profile, role: 'student' }];
+    throw new Error(`Unexpected path: ${path}`);
+  };
+  const studentAttempt = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer student-jwt' },
+      body: JSON.stringify({ action: 'create-student', name: 'محاولة', code: 's100', password: 'temporary-pass' })
+    }),
+    edgeEnv
+  );
+  assert.equal(studentAttempt.status, 403);
+
+  // 3. Even if email matches primary owner, if database profile role is student, Edge Function rejects with 403
+  upstream = path => {
+    if (path === '/auth/v1/user') return { id: studentId, email: 'futureoflife025@gmail.com', email_confirmed_at: '2026-10-22' };
+    if (path.startsWith('/rest/v1/profiles?')) return [{ ...profile, role: 'student' }];
+    throw new Error(`Unexpected path: ${path}`);
+  };
+  const emailOnlyAttempt = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer owner-jwt' },
+      body: JSON.stringify({ action: 'list-teachers' })
+    }),
+    edgeEnv
+  );
+  assert.equal(emailOnlyAttempt.status, 403);
+
+  // 4. Verified teacher can create-student, reset-password, list-teachers, and manage-teacher; orphan user is cleaned on DB failure
+  let failProfileInsert = false;
+  upstream = (path, options) => {
+    if (path === '/auth/v1/user') return { id: studentId, email: 'futureoflife025@gmail.com', email_confirmed_at: '2026-10-22' };
+    if (path === `/rest/v1/profiles?id=eq.${studentId}&select=*`) return [{ ...profile, role: 'teacher' }];
+    if (path.startsWith('/rest/v1/profiles?code=eq.')) return [];
+    if (path === '/auth/v1/admin/users' && options.method === 'POST') return { id: otherId };
+    if (path === '/rest/v1/profiles' && options.method === 'POST') {
+      if (failProfileInsert) return new Response('{"message":"db fail"}', { status: 500 });
+      return {};
+    }
+    if (path === `/auth/v1/admin/users/${otherId}` && options.method === 'DELETE') return {};
+    if (path === `/rest/v1/profiles?id=eq.${otherId}&role=eq.student&select=id`) return [{ id: otherId }];
+    if (path === `/auth/v1/admin/users/${otherId}` && options.method === 'PUT') return {};
+    if (path.startsWith(`/rest/v1/profiles?id=eq.${otherId}`) && options.method === 'PATCH') return {};
+    if (path.startsWith('/auth/v1/admin/users?')) {
+      return {
+        users: [
+          { id: studentId, email: 'futureoflife025@gmail.com', email_confirmed_at: '2026-10-22', app_metadata: {} },
+          { id: otherId, email: 'teacher2@example.com', email_confirmed_at: '2026-10-22', app_metadata: {} }
+        ]
+      };
+    }
+    if (path.includes('role=eq.teacher')) return [{ ...profile, role: 'teacher' }];
+    if (path === `/rest/v1/profiles?id=eq.${otherId}&select=*`) return [{ ...profile, id: otherId, role: 'student' }];
+    throw new Error(`Unexpected path: ${path}`);
+  };
+
+  const okCreate = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer teacher-jwt' },
+      body: JSON.stringify({ action: 'create-student', name: 'طالبة ممتازة', code: 's101', password: 'temporary-pass' })
+    }),
+    edgeEnv
+  );
+  assert.equal(okCreate.status, 201);
+  assert.ok(!(await okCreate.text()).includes('edge-service-secret'));
+
+  // Test orphan user rollback on profile insert failure
+  failProfileInsert = true;
+  calls.length = 0;
+  const failedCreate = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer teacher-jwt' },
+      body: JSON.stringify({ action: 'create-student', name: 'طالبة ممتازة', code: 's102', password: 'temporary-pass' })
+    }),
+    edgeEnv
+  );
+  assert.equal(failedCreate.status, 502);
+  assert.ok(calls.some(c => c.path === `/auth/v1/admin/users/${otherId}` && c.method === 'DELETE'));
+  failProfileInsert = false;
+
+  const okReset = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer teacher-jwt' },
+      body: JSON.stringify({ action: 'reset-password', studentId: otherId, password: 'temporary-pass' })
+    }),
+    edgeEnv
+  );
+  assert.equal(okReset.status, 200);
+
+  const okList = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer teacher-jwt' },
+      body: JSON.stringify({ action: 'list-teachers' })
+    }),
+    edgeEnv
+  );
+  assert.equal(okList.status, 200);
+
+  const okManage = await handleAdminRequest(
+    new Request('https://test.supabase.co/functions/v1/admin-actions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer teacher-jwt' },
+      body: JSON.stringify({ action: 'manage-teacher', email: 'teacher2@example.com', operation: 'grant', canManageTeachers: true })
+    }),
+    edgeEnv
+  );
+  assert.equal(okManage.status, 200);
+});
+
+test('UI subtitle displays كيمياء 2 while scientific textbook references remain كتاب كيمياء 1', () => {
+  const appSource = fs.readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  assert.match(appSource, /للذرات والأيونات • كيمياء 2/);
+  assert.doesNotMatch(appSource, /للذرات والأيونات • كيمياء 1/);
+  const prePostSource = fs.readFileSync(new URL('../src/data/prePostTestData.js', import.meta.url), 'utf8');
+  assert.match(prePostSource, /كتاب كيمياء 1/);
 });
 
 test('accidentally placing publishable or anon key in SUPABASE_SERVICE_ROLE_KEY is rejected on admin actions', async () => {

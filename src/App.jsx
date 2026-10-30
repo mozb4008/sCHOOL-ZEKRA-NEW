@@ -122,7 +122,7 @@ export default function App() {
                 </div>
                 <div>
                   <h4 className="font-black text-lg text-white">أتقن مهارتي – التوزيع الإلكتروني</h4>
-                  <p className="text-xs text-emerald-300">مبادرة تعليمية نوعية للذرات والأيونات • كيمياء 1</p>
+                  <p className="text-xs text-emerald-300">مبادرة تعليمية نوعية للذرات والأيونات • كيمياء 2</p>
                 </div>
               </div>
               <p className="text-xs text-slate-300 leading-relaxed font-normal">
