@@ -24,16 +24,20 @@ function localPlatform() {
     }
   };
 }
-export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), '');
-  for (const key of ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY']) {
-    if (env[key]) process.env[key] = env[key];
+export default defineConfig(({ command, mode }) => {
+  if (command === 'serve') {
+    const env = loadEnv(mode, process.cwd(), '');
+    for (const key of ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY', 'VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'VITE_SUPABASE_PUBLISHABLE_KEY']) {
+      if (env[key] && !process.env[key]) process.env[key] = env[key];
+    }
   }
   return {
-  plugins: [react(), localPlatform()],
-  server: {
-    port: 5173,
-    open: false,
-    host: '127.0.0.1'
-  }
-}; });
+    envPrefix: 'VITE_',
+    plugins: [react(), localPlatform()],
+    server: {
+      port: 5173,
+      open: false,
+      host: '127.0.0.1'
+    }
+  };
+});

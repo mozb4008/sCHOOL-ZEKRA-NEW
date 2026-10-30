@@ -343,7 +343,7 @@ export const errorChallengeBank = [
     correctConfig: "1s² 2s² 2p¹",
     options: [
       { text: "1s² 2s² 2p¹", isCorrect: true },
-      { text: "1s² 2s² 2p¹", isCorrect: false },
+      { text: "1s² 2p³", isCorrect: false },
       { text: "1s² 2s³", isCorrect: false },
       { text: "1s¹ 2s² 2p²", isCorrect: false }
     ],

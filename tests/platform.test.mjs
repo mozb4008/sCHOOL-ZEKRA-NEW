@@ -1,5 +1,6 @@
 import test, { beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { handler } from '../netlify/functions/platform.mjs';
 import { gradeAssessment, gradeChallenge, assessmentHistory, publicQuestions } from '../netlify/functions/lib/grading.mjs';
 import { preTestQuestions, postTestQuestions } from '../src/data/prePostTestData.js';
@@ -19,6 +20,11 @@ beforeEach(() => {
   process.env.SUPABASE_URL = 'https://test.supabase.co';
   process.env.SUPABASE_ANON_KEY = 'test-anon';
   process.env.SUPABASE_SERVICE_ROLE_KEY = 'test-service';
+  delete process.env.VITE_SUPABASE_URL;
+  delete process.env.SUPABASE_PUBLISHABLE_KEY;
+  delete process.env.VITE_SUPABASE_ANON_KEY;
+  delete process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+  delete process.env.SUPABASE_SECRET_KEY;
   calls = [];
   upstream = path => {
     if (path === '/auth/v1/user') return { id: studentId };
@@ -64,10 +70,12 @@ test('public questions do not reveal keys or explanations', () => {
   assert.ok(!serialized.includes('explanation'));
   assert.equal(publicQuestions().pre.length, 10);
 });
-test('missing configuration is explicit and blocks login', async () => {
+test('missing configuration is explicit and blocks login while SERVICE_ROLE_KEY is optional', async () => {
   delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  assert.deepEqual(parse(await handler(event({ action: 'status' }))), { configured: true, missing: [] });
+  delete process.env.SUPABASE_ANON_KEY;
   assert.equal(parse(await handler(event({ action: 'status' }))).configured, false);
-  assert.deepEqual(parse(await handler(event({ action: 'status' }))).missing, ['SUPABASE_SERVICE_ROLE_KEY']);
+  assert.deepEqual(parse(await handler(event({ action: 'status' }))).missing, ['SUPABASE_ANON_KEY']);
   assert.equal((await handler(event({ action: 'login' }))).statusCode, 503);
   assert.equal(calls.length, 0);
 });
@@ -106,13 +114,13 @@ test('invalid API configuration is distinguished from an incorrect password', as
   const credentials = await handler(event({ action: 'login', username: 's001', password: 'password' }));
   assert.equal(credentials.statusCode, 401); assert.ok(!parse(credentials).error.includes('SUPABASE_ANON_KEY'));
 });
-test('confirmation errors and invalid server credentials have distinct messages', async () => {
+test('confirmation errors and unapplied RLS policies have distinct messages', async () => {
   upstream = () => new Response(JSON.stringify({ error_code: 'email_not_confirmed' }), { status: 400 });
   const confirmation = parse(await handler(event({ action: 'login', username: 's001', password: 'password' }))).error;
   assert.match(confirmation, /غير مؤكد/); assert.match(confirmation, /رابط التأكيد/); assert.doesNotMatch(confirmation, /Supabase|Authentication|Users/);
   upstream = path => path === '/auth/v1/user' ? { id: studentId } : new Response('{}', { status: 401 });
   const res = await handler(event({ action: 'me' }));
-  assert.equal(res.statusCode, 503); assert.match(parse(res).error, /SUPABASE_SERVICE_ROLE_KEY/);
+  assert.equal(res.statusCode, 503); assert.match(parse(res).error, /rls-policies\.sql/);
 });
 test('anonymous user cannot read records', async () => {
   const res = await handler(event({ action: 'me' }, { cookie: '' }));
@@ -145,18 +153,21 @@ test('post-test requires saved baseline', async () => {
   const res = await handler(event({ action: 'submit-assessment', type: 'post', requestId: attemptId, answers: answers(postTestQuestions), seconds: 20 }));
   assert.equal(res.statusCode, 400); assert.ok(!calls.some(c => c.method === 'POST'));
 });
-test('server ignores fabricated score and owner on assessment write', async () => {
+test('server ignores fabricated score and owner on assessment write and delegates grading to RPC', async () => {
   upstream = (path, options) => {
     if (path === '/auth/v1/user') return { id: studentId };
     if (path.startsWith('/rest/v1/profiles?')) return [profile];
-    if (options.method === 'POST') return null;
+    if (path === '/rest/v1/rpc/submit_assessment_attempt') return { score: 0 };
+    if (options.method === 'POST') throw new Error(`Direct table POST is forbidden: ${path}`);
     return [];
   };
   const wrong = Object.fromEntries(preTestQuestions.map((q, i) => [i, (q.correctAnswer + 1) % q.options.length]));
-  const res = await handler(event({ action: 'submit-assessment', type: 'pre', requestId: attemptId, answers: wrong, seconds: 10, score: 100, student_id: otherId }));
+  const res = await handler(event({ action: 'submit-assessment', type: 'pre', requestId: attemptId, answers: wrong, seconds: 10, score: 100, result: { score: 100 }, student_id: otherId }));
   assert.equal(res.statusCode, 200);
   const write = calls.find(c => c.method === 'POST');
-  assert.equal(write.data.student_id, studentId); assert.equal(write.data.result.score, 0);
+  assert.equal(write.path, '/rest/v1/rpc/submit_assessment_attempt');
+  assert.deepEqual(write.data, { p_request_id: attemptId, p_type: 'pre', p_answers: wrong, p_seconds: 10 });
+  assert.ok(!('score' in write.data) && !('result' in write.data) && !('student_id' in write.data));
 });
 test('retry of the same assessment does not insert twice', async () => {
   const normal = upstream;
@@ -263,18 +274,19 @@ test('recovery and resend requests contain no role or user enumeration in respon
   assert.equal(calls[0].data.email, 'real@example.com');
   assert.equal(calls[1].data.type, 'signup');
 });
-test('confirmed users receive a student profile automatically, ignoring metadata role', async () => {
-  let created;
+test('confirmed users receive a student profile automatically via RPC, ignoring metadata role', async () => {
+  let rpcPayload;
+  const provisionedProfile = { id: studentId, name: 'طالبة مسجلة', code: `s-${studentId.replaceAll('-', '')}`, role: 'student', must_change_password: false };
   upstream = (path, options) => {
     if (path === '/auth/v1/user') return { id: studentId, email: 'real@example.com', email_confirmed_at: '2026-10-21', user_metadata: { name: 'طالبة مسجلة', role: 'teacher' } };
-    if (path.startsWith('/rest/v1/profiles?on_conflict=')) { created = JSON.parse(options.body); return null; }
-    if (path.startsWith('/rest/v1/profiles?')) return created ? [created] : [];
+    if (path === '/rest/v1/rpc/ensure_student_profile') { rpcPayload = JSON.parse(options.body); return provisionedProfile; }
+    if (path.startsWith('/rest/v1/profiles?')) return rpcPayload ? [provisionedProfile] : [];
     return [];
   };
   const res = await handler(event({ action: 'me', role: 'teacher' }));
   assert.equal(res.statusCode, 200); assert.equal(parse(res).profile.role, 'student');
-  assert.equal(created.role, 'student'); assert.equal(created.must_change_password, false);
-  assert.match(created.code, /^s-[0-9a-f]{32}$/);
+  assert.deepEqual(rpcPayload, { p_name: 'طالبة مسجلة' });
+  assert.ok(!('role' in rpcPayload) && !('id' in rpcPayload));
 });
 test('unconfirmed users cannot create a profile by claiming a name or role', async () => {
   upstream = path => path === '/auth/v1/user' ? { id: studentId, email: 'real@example.com', user_metadata: { name: 'طالبة', role: 'teacher' } } : [];
@@ -367,4 +379,113 @@ test('owner revocation clears delegated authority and changes role to student', 
   assert.equal((await handler(event({ action: 'manage-teacher', email: 'teacher@example.com', operation: 'revoke', canManageTeachers: false }))).statusCode, 200);
   assert.equal(calls.find(c => c.method === 'PUT').data.app_metadata.manage_teachers, false);
   assert.equal(calls.find(c => c.method === 'PATCH').data.role, 'student');
+});
+
+test('fallback environment variables and quoted values are supported safely without SERVICE_ROLE_KEY', async () => {
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_ANON_KEY;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  process.env.VITE_SUPABASE_URL = ' "https://test.supabase.co///" ';
+  process.env.VITE_SUPABASE_PUBLISHABLE_KEY = "'sb_publishable_fallback'";
+  const status = parse(await handler(event({ action: 'status' })));
+  assert.deepEqual(status, { configured: true, missing: [] });
+});
+
+test('core student and teacher operations work via RLS without SUPABASE_SERVICE_ROLE_KEY', async () => {
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const meRes = await handler(event({ action: 'me' }));
+  assert.equal(meRes.statusCode, 200);
+  assert.ok(calls.every(c => c.headers.apikey === 'test-anon' && c.headers.Authorization === 'Bearer token'));
+
+  calls.length = 0;
+  upstream = path => {
+    if (path === '/auth/v1/user') return { id: studentId, email: 'futureoflife025@gmail.com', email_confirmed_at: '2026-10-22' };
+    if (path.startsWith('/rest/v1/profiles?')) return [{ ...profile, role: 'teacher' }];
+    return [];
+  };
+  const dashRes = await handler(event({ action: 'dashboard' }));
+  assert.equal(dashRes.statusCode, 200);
+  assert.ok(calls.every(c => c.headers.apikey === 'test-anon' && c.headers.Authorization === 'Bearer token'));
+});
+
+test('admin operations requiring SERVICE_ROLE_KEY are gracefully disabled with a clear message when key is absent', async () => {
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  upstream = path => {
+    if (path === '/auth/v1/user') return { id: studentId, email: 'futureoflife025@gmail.com', email_confirmed_at: '2026-10-22' };
+    if (path.startsWith('/rest/v1/profiles?')) return [{ ...profile, role: 'teacher' }];
+    return [];
+  };
+  for (const body of [
+    { action: 'create-student', name: 'طالبة', code: 's099', password: 'temporary-pass' },
+    { action: 'reset-password', studentId: otherId, password: 'temporary-pass' },
+    { action: 'list-teachers' },
+    { action: 'manage-teacher', email: 't@example.com', operation: 'grant', canManageTeachers: false }
+  ]) {
+    const res = await handler(event(body));
+    assert.equal(res.statusCode, 503);
+    assert.match(parse(res).error, /معطّلة مؤقتًا|SUPABASE_SERVICE_ROLE_KEY/);
+  }
+});
+
+test('accidentally placing publishable or anon key in SUPABASE_SERVICE_ROLE_KEY is rejected on admin actions', async () => {
+  teacherAccessMock();
+  process.env.SUPABASE_SERVICE_ROLE_KEY = 'sb_publishable_mistake';
+  const res1 = await handler(event({ action: 'list-teachers' }));
+  assert.equal(res1.statusCode, 503);
+  assert.match(parse(res1).error, /SUPABASE_SERVICE_ROLE_KEY/);
+  process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_ANON_KEY;
+  const res2 = await handler(event({ action: 'list-teachers' }));
+  assert.equal(res2.statusCode, 503);
+  assert.match(parse(res2).error, /SUPABASE_SERVICE_ROLE_KEY/);
+});
+
+test('rls-policies.sql enforces non-destructive RLS, zero direct writes, private answer vault, and RPC security', () => {
+  const sql = fs.readFileSync(new URL('../supabase/rls-policies.sql', import.meta.url), 'utf8');
+  // 1. Non-destructive to existing data
+  assert.doesNotMatch(sql, /\bdrop\s+table\b|\btruncate\b|\bdelete\s+from\b/i);
+  // 2. Direct INSERT, UPDATE, DELETE are completely revoked from anon and authenticated on all public tables
+  assert.match(sql, /revoke all on public\.profiles, public\.assessment_attempts, public\.challenge_attempts from public, anon, authenticated/i);
+  assert.match(sql, /grant select on public\.profiles, public\.assessment_attempts, public\.challenge_attempts to authenticated/i);
+  assert.doesNotMatch(sql, /grant\s+[^\n]*\b(insert|update|delete)\b[^\n]*on\s+public\.(profiles|assessment_attempts|challenge_attempts)\s+to\s+(authenticated|anon|public)/i);
+  assert.doesNotMatch(sql, /create\s+policy\s+\S+\s+on\s+public\.(profiles|assessment_attempts|challenge_attempts)\s+for\s+(insert|update|delete)/i);
+  // 3. Answer keys are isolated in atqin_private schema and never present inside CREATE FUNCTION bodies (pg_proc)
+  assert.match(sql, /revoke all on schema atqin_private from public, anon, authenticated/i);
+  assert.match(sql, /revoke all on all tables in schema atqin_private from public, anon, authenticated/i);
+  const functionBodies = sql.slice(sql.indexOf('-- 5. دالة التحقق'));
+  assert.ok(!functionBodies.includes(preTestQuestions[0].explanation));
+  assert.ok(!functionBodies.includes(postTestQuestions[0].explanation));
+  for (const q of [...preTestQuestions, ...postTestQuestions]) {
+    assert.ok(sql.includes(q.id), `Missing question ${q.id} in SQL answer vault`);
+  }
+  for (const c of errorChallengeBank) {
+    assert.ok(sql.includes(c.id), `Missing challenge ${c.id} in SQL answer vault`);
+  }
+  // 4. All SECURITY DEFINER functions lock search_path and revoke execution from public and anon
+  for (const fn of ['is_teacher()', 'ensure_student_profile(text)', 'complete_password_change()', 'submit_assessment_attempt(uuid, text, jsonb, integer)', 'submit_challenge_attempt(uuid, text, integer)']) {
+    assert.ok(sql.includes(`revoke all on function public.${fn} from public, anon;`), `Missing revoke on ${fn}`);
+    assert.ok(sql.includes(`grant execute on function public.${fn} to authenticated, service_role;`), `Missing grant on ${fn}`);
+  }
+});
+
+test('challenge and password-change actions use dedicated RPCs and strip forged fields', async () => {
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  upstream = (path, options) => {
+    if (path === '/auth/v1/user') return { id: studentId };
+    if (path.startsWith('/rest/v1/profiles?')) return [profile];
+    if (path === '/rest/v1/rpc/submit_challenge_attempt') return false;
+    if (path === '/rest/v1/rpc/complete_password_change') return null;
+    if (options.method === 'POST' || options.method === 'PATCH') throw new Error(`Direct table write is forbidden: ${path}`);
+    return [];
+  };
+  const chRes = await handler(event({ action: 'challenge', requestId: attemptId, challengeId: 'err-ion-1', choice: 1, correct: true, student_id: otherId }));
+  assert.equal(chRes.statusCode, 200);
+  const rpcCall = calls.find(c => c.path === '/rest/v1/rpc/submit_challenge_attempt');
+  assert.deepEqual(rpcCall.data, { p_request_id: attemptId, p_challenge_id: 'err-ion-1', p_choice: 1 });
+  assert.ok(!('correct' in rpcCall.data) && !('student_id' in rpcCall.data));
+
+  calls.length = 0;
+  const pwRes = await handler(event({ action: 'change-password', password: 'new-strong-password-123', role: 'teacher' }));
+  assert.equal(pwRes.statusCode, 200);
+  const pwRpc = calls.find(c => c.path === '/rest/v1/rpc/complete_password_change');
+  assert.deepEqual(pwRpc.data, {});
 });

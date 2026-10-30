@@ -4,12 +4,12 @@
 
 ## Supabase
 
-1. افتح نفس المشروع الذي يتصل به موقع `school-zekra.netlify.app`.
+1. افتح نفس المشروع الذي يتصل به موقع `school-zekra-new.netlify.app`.
 2. Authentication > Sign In / Providers: فعّل **Allow new users to sign up**.
 3. داخل مزوّد Email اترك تسجيل الدخول بالبريد مفعّلًا، وفعّل **Confirm email**. يتوقف التسجيل الذاتي برسالة واضحة إذا كان التأكيد معطّلًا.
 4. Authentication > URL Configuration:
-   - Site URL: `https://school-zekra.netlify.app/`
-   - أضف إلى Redirect URLs: `https://school-zekra.netlify.app/?auth=callback`
+   - Site URL: `https://school-zekra-new.netlify.app/`
+   - أضف إلى Redirect URLs: `https://school-zekra-new.netlify.app/?auth=callback`
 5. اترك قوالب Confirm signup وReset password على الروابط الافتراضية `{{ .ConfirmationURL }}`. لا تستبدل الرابط باسم الموقع أو Project URL. يستخدم الموقع جلسة التأكيد المرسلة في رابط البريد ثم يحوّلها إلى ملفات ارتباط HttpOnly؛ لا يحفظ رموز الجلسة في localStorage.
 6. بعد وصول الطالبة من رابط التأكيد يُنشأ لها ملف student تلقائيًا. القيم التي تُرسل من نموذج التسجيل لا تسمح بتعيين دور teacher. تظل حسابات المعلمة السابقة كما هي.
 

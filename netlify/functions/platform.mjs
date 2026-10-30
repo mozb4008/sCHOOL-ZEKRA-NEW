@@ -34,18 +34,28 @@ export async function handler(event) {
     try { body = JSON.parse(event.body || '{}'); } catch { throw new ApiError(400, 'الطلب غير صالح.'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ApiError(400, 'الطلب غير صالح.');
     const { action } = body;
-    const url = process.env.SUPABASE_URL?.trim().replace(/\/$/, '');
-    const anon = process.env.SUPABASE_ANON_KEY?.trim();
-    const service = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
-    const configured = !!(url && anon && service);
-    const missing = [['SUPABASE_URL', url], ['SUPABASE_ANON_KEY', anon], ['SUPABASE_SERVICE_ROLE_KEY', service]]
+    const cleanEnv = value => typeof value === 'string' ? value.trim().replace(/^['"]+|['"]+$/g, '').trim() : '';
+    const url = (cleanEnv(process.env.SUPABASE_URL) || cleanEnv(process.env.VITE_SUPABASE_URL)).replace(/\/+$/, '');
+    const anon = cleanEnv(process.env.SUPABASE_ANON_KEY) || cleanEnv(process.env.SUPABASE_PUBLISHABLE_KEY) || cleanEnv(process.env.VITE_SUPABASE_ANON_KEY) || cleanEnv(process.env.VITE_SUPABASE_PUBLISHABLE_KEY);
+    const service = cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY) || cleanEnv(process.env.SUPABASE_SECRET_KEY);
+    const configured = !!(url && anon);
+    const missing = [['SUPABASE_URL', url], ['SUPABASE_ANON_KEY', anon]]
       .filter(([, value]) => !value).map(([name]) => name);
     // Expose variable names only; credentials never leave the server.
     if (action === 'status') return reply(200, { configured, missing });
     if (!configured) throw new ApiError(503, 'المنصة بانتظار تفعيل قاعدة البيانات من مسؤول المنصة.');
-    const request = async (path, { method = 'GET', data, token = service, admin = true, prefer } = {}) => {
+    const request = async (path, { method = 'GET', data, token = anon, admin = false, prefer } = {}) => {
+      if (admin) {
+        if (!service) {
+          throw new ApiError(503, 'هذه العملية الإدارية معطّلة مؤقتًا لأن المنصة تعمل بوضع الحماية القياسي (RLS) دون SUPABASE_SERVICE_ROLE_KEY. يمكن للطالبات والمعلمات التسجيل واستعادة كلمة المرور عبر البريد الإلكتروني.');
+        }
+        if (/^sb_publishable_/.test(service) || service === anon) {
+          throw new ApiError(503, 'إعداد الربط غير صحيح: المتغير SUPABASE_SERVICE_ROLE_KEY يحتوي على المفتاح العام بدل المفتاح السري (service_role أو sb_secret_).');
+        }
+      }
+      const effectiveToken = admin ? service : token;
       // New sb_publishable_/sb_secret_ keys belong only in apikey; they are not JWTs.
-      const authorization = /^sb_(publishable|secret)_/.test(token) ? {} : { Authorization: `Bearer ${token}` };
+      const authorization = /^sb_(publishable|secret)_/.test(effectiveToken) ? {} : { Authorization: `Bearer ${effectiveToken}` };
       const res = await fetch(`${url}${path}`, { method, signal: AbortSignal.timeout(12000), headers: {
         apikey: admin ? service : anon, ...authorization, 'Content-Type': 'application/json',
         ...(prefer ? { Prefer: prefer } : {}) }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) });
@@ -64,7 +74,10 @@ export async function handler(event) {
             (invalidKey && (admin || path.includes('/token') || /api.?key/i.test(result?.message || result?.msg || '')))) {
           throw new ApiError(503, `إعداد الربط غير صحيح: تحققي من ${admin ? 'SUPABASE_SERVICE_ROLE_KEY' : 'SUPABASE_ANON_KEY'} وأنه من نفس مشروع SUPABASE_URL، ثم أعيدي النشر.`);
         }
-        if (['PGRST205', '42P01', '42501'].includes(code)) throw new ApiError(503, 'جداول المنصة أو صلاحياتها غير جاهزة في مشروع Supabase المرتبط. شغّلي ملف schema.sql في المشروع نفسه.');
+        if (['PGRST202', 'PGRST205', '42P01', '42501', '42883'].includes(code) || (path.startsWith('/rest/v1/') && [401, 403, 404].includes(res.status))) {
+          throw new ApiError(503, 'جداول المنصة أو دوال الصلاحيات (RLS/RPC) غير جاهزة في مشروع Supabase المرتبط. شغّلي ملف supabase/rls-policies.sql في المشروع نفسه.');
+        }
+        if (code === '22023') throw new ApiError(400, result?.message || 'البيانات المرسلة غير صالحة.');
         if (res.status === 401 || res.status === 403) throw new ApiError(401, 'انتهت الجلسة أو بيانات الدخول غير صحيحة.');
         if (result?.code === '23505' || result?.code === 'email_exists') throw new ApiError(409, 'السجل موجود مسبقًا.');
         if (path.includes('/token')) throw new ApiError(401, 'اسم المستخدم أو كلمة المرور غير صحيحة.');
@@ -76,20 +89,21 @@ export async function handler(event) {
     // Public health check returns connectivity only, never profile data or key values.
     if (action === 'check-connection') {
       await request('/auth/v1/settings', { admin: false, token: anon });
-      await request('/rest/v1/profiles?select=id&limit=1');
+      if (service) await request('/rest/v1/profiles?select=id&limit=1', { admin: true });
       return reply(200, { auth: true, database: true });
     }
+    const cookies = Object.fromEntries((headers.cookie || '').split(';').filter(v => v.includes('=')).map(v => {
+      const i = v.indexOf('='); return [v.slice(0, i).trim(), decodeURIComponent(v.slice(i + 1))];
+    }));
+    const db = (path, options = {}) => request(path, { ...options, token: cookies.atqin_access, admin: false });
     const allRows = async (table, filter = '') => {
       const rows = [];
       for (let offset = 0; ; offset += 500) {
-        const page = await request(`/rest/v1/${table}?select=*&order=created_at.asc,id.asc&limit=500&offset=${offset}${filter ? `&${filter}` : ''}`);
+        const page = await db(`/rest/v1/${table}?select=*&order=created_at.asc,id.asc&limit=500&offset=${offset}${filter ? `&${filter}` : ''}`);
         rows.push(...page);
         if (page.length < 500) return rows;
       }
     };
-    const cookies = Object.fromEntries((headers.cookie || '').split(';').filter(v => v.includes('=')).map(v => {
-      const i = v.indexOf('='); return [v.slice(0, i).trim(), decodeURIComponent(v.slice(i + 1))];
-    }));
     const callbackUrl = `${secure ? 'https' : 'http'}://${headers.host}/?auth=callback`;
     if (['signup', 'recover-password', 'resend-confirmation'].includes(action)) {
       const email = String(body.email || '').trim().toLowerCase();
@@ -138,12 +152,14 @@ export async function handler(event) {
     }
     if (!cookies.atqin_access) throw new ApiError(401, 'سجّلي الدخول أولًا.');
     const user = await request('/auth/v1/user', { token: cookies.atqin_access, admin: false });
-    let [profile] = await request(`/rest/v1/profiles?id=eq.${user.id}&select=*`);
+    let [profile] = await db(`/rest/v1/profiles?id=eq.${user.id}&select=*`);
     if (!profile && user.email && user.email_confirmed_at && !user.email.endsWith('@students.atqin.invalid')) {
       const name = String(user.user_metadata?.name || user.email.split('@')[0]).trim().slice(0, 120);
-      await request('/rest/v1/profiles?on_conflict=id', { method: 'POST', prefer: 'resolution=ignore-duplicates',
-        data: { id: user.id, name: name.length >= 2 ? name : 'طالبة جديدة', code: `s-${user.id.replaceAll('-', '')}`, role: 'student', must_change_password: false } });
-      [profile] = await request(`/rest/v1/profiles?id=eq.${user.id}&select=*`);
+      const provisioned = await db('/rest/v1/rpc/ensure_student_profile', { method: 'POST',
+        data: { p_name: name.length >= 2 ? name : 'طالبة جديدة' } });
+      profile = provisioned && typeof provisioned === 'object' && !Array.isArray(provisioned) && provisioned.id
+        ? provisioned
+        : (await db(`/rest/v1/profiles?id=eq.${user.id}&select=*`))[0];
     }
     if (!profile) throw new ApiError(403, 'الحساب غير مفعّل. تواصلي مع المعلمة.');
     const isOwner = profile.role === 'teacher' && !!ownsPlatform(user);
@@ -159,7 +175,7 @@ export async function handler(event) {
     if (action === 'change-password') {
       if (typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) throw new ApiError(400, 'استخدمي كلمة مرور من 10 أحرف على الأقل.');
       await request('/auth/v1/user', { method: 'PUT', token: cookies.atqin_access, admin: false, data: { password: body.password } });
-      await request(`/rest/v1/profiles?id=eq.${user.id}`, { method: 'PATCH', data: { must_change_password: false } });
+      await db('/rest/v1/rpc/complete_password_change', { method: 'POST', data: {} });
       return reply(200, { ok: true }, [cookie('atqin_recovery', '', 0)]);
     }
     if (profile.must_change_password) throw new ApiError(403, 'غيّري كلمة المرور المؤقتة أولًا.');
@@ -169,29 +185,38 @@ export async function handler(event) {
       if (profile.role !== 'student') throw new ApiError(403, 'التسجيل مخصص لحسابات الطالبات.');
       if (!uuid(body.requestId)) throw new ApiError(400, 'معرّف المحاولة غير صحيح.');
       if (action === 'submit-assessment') {
-        let result;
-        try { result = gradeAssessment(body.type, body.answers, body.seconds); } catch (e) { throw new ApiError(400, e.message); }
-        const existing = await request(`/rest/v1/assessment_attempts?id=eq.${body.requestId}&student_id=eq.${user.id}&select=id`);
+        try { gradeAssessment(body.type, body.answers, body.seconds); } catch (e) { throw new ApiError(400, e.message); }
+        const existing = await db(`/rest/v1/assessment_attempts?id=eq.${body.requestId}&student_id=eq.${user.id}&select=id`);
         if (!existing.length) {
-          const baseline = await request(`/rest/v1/assessment_attempts?student_id=eq.${user.id}&type=eq.pre&select=id`);
+          const baseline = await db(`/rest/v1/assessment_attempts?student_id=eq.${user.id}&type=eq.pre&select=id`);
           if (body.type === 'post' && !baseline.length) throw new ApiError(400, 'أكملي الاختبار القبلي أولًا.');
           if (body.type === 'pre' && baseline.length) throw new ApiError(409, 'الاختبار القبلي محفوظ مسبقًا حفاظًا على دقة قياس الأثر.');
-          await request('/rest/v1/assessment_attempts', { method: 'POST', data: { id: body.requestId, student_id: user.id, type: body.type, result } });
+          const cleanAnswers = Object.fromEntries(Object.entries(body.answers).map(([k, v]) => [k, Number(v)]));
+          await db('/rest/v1/rpc/submit_assessment_attempt', { method: 'POST',
+            data: { p_request_id: body.requestId, p_type: body.type, p_answers: cleanAnswers, p_seconds: body.seconds } });
         }
       } else {
-        let correct;
-        try { correct = gradeChallenge(body.challengeId, body.choice); } catch (e) { throw new ApiError(400, e.message); }
-        await request('/rest/v1/challenge_attempts?on_conflict=id', { method: 'POST', prefer: 'resolution=ignore-duplicates',
-          data: { id: body.requestId, student_id: user.id, challenge_id: body.challengeId, correct } });
+        try { gradeChallenge(body.challengeId, body.choice); } catch (e) { throw new ApiError(400, e.message); }
+        await db('/rest/v1/rpc/submit_challenge_attempt', { method: 'POST',
+          data: { p_request_id: body.requestId, p_challenge_id: body.challengeId, p_choice: body.choice } });
       }
       return reply(200, await ownData());
     }
     if (profile.role !== 'teacher') throw new ApiError(403, 'هذه الصفحة متاحة للمعلمة فقط.');
+    const requireAdmin = () => {
+      if (!service) {
+        throw new ApiError(503, 'هذه العملية الإدارية معطّلة مؤقتًا لأن المنصة تعمل بوضع الحماية القياسي (RLS) دون SUPABASE_SERVICE_ROLE_KEY. يمكن للطالبات والمعلمات التسجيل واستعادة كلمة المرور عبر البريد الإلكتروني.');
+      }
+      if (/^sb_publishable_/.test(service) || service === anon) {
+        throw new ApiError(503, 'إعداد الربط غير صحيح: المتغير SUPABASE_SERVICE_ROLE_KEY يحتوي على المفتاح العام بدل المفتاح السري (service_role أو sb_secret_).');
+      }
+    };
     if (action === 'manage-teacher' || action === 'list-teachers') {
       if (!canManageTeachers) throw new ApiError(403, 'لا تملكين صلاحية إدارة المعلمات.');
+      requireAdmin();
       const users = [];
       for (let page = 1; ; page++) {
-        const result = await request(`/auth/v1/admin/users?page=${page}&per_page=100`);
+        const result = await request(`/auth/v1/admin/users?page=${page}&per_page=100`, { admin: true });
         const batch = result?.users || [];
         users.push(...batch);
         if (batch.length < 100) break;
@@ -209,15 +234,15 @@ export async function handler(event) {
       if (!target || !target.email_confirmed_at) throw new ApiError(400, 'يجب أن تسجّل المعلمة بهذا البريد وتؤكده أولًا، ثم تسجّل الدخول مرة واحدة.');
       if (target.id === user.id || target.email?.toLowerCase() === ownerEmail) throw new ApiError(403, 'لا يمكن تعديل صلاحية المسؤول الأساسي أو حسابكِ من هنا.');
       if (!isOwner && (body.operation === 'revoke' || body.canManageTeachers || target.app_metadata?.manage_teachers === true)) throw new ApiError(403, 'هذه الصلاحية متاحة للمسؤول الأساسي فقط. يمكنكِ إضافة معلمات لمتابعة النتائج.');
-      const [targetProfile] = await request(`/rest/v1/profiles?id=eq.${target.id}&select=*`);
+      const [targetProfile] = await db(`/rest/v1/profiles?id=eq.${target.id}&select=*`);
       if (!targetProfile) throw new ApiError(400, 'اطلبي من المعلمة تسجيل الدخول مرة واحدة لإكمال حسابها.');
       const grant = body.operation === 'grant';
       // App metadata is server-controlled; public user metadata never grants authority.
-      await request(`/auth/v1/admin/users/${target.id}`, { method: 'PUT', data: { app_metadata: { ...target.app_metadata, manage_teachers: grant && isOwner && body.canManageTeachers } } });
+      await request(`/auth/v1/admin/users/${target.id}`, { method: 'PUT', admin: true, data: { app_metadata: { ...target.app_metadata, manage_teachers: grant && isOwner && body.canManageTeachers } } });
       try {
-        await request(`/rest/v1/profiles?id=eq.${target.id}`, { method: 'PATCH', data: { role: grant ? 'teacher' : 'student' } });
+        await request(`/rest/v1/profiles?id=eq.${target.id}`, { method: 'PATCH', admin: true, data: { role: grant ? 'teacher' : 'student' } });
       } catch (error) {
-        await request(`/auth/v1/admin/users/${target.id}`, { method: 'PUT', data: { app_metadata: { ...target.app_metadata, manage_teachers: target.app_metadata?.manage_teachers === true } } }).catch(() => {});
+        await request(`/auth/v1/admin/users/${target.id}`, { method: 'PUT', admin: true, data: { app_metadata: { ...target.app_metadata, manage_teachers: target.app_metadata?.manage_teachers === true } } }).catch(() => {});
         throw error;
       }
       return reply(200, { ok: true });
@@ -227,27 +252,29 @@ export async function handler(event) {
       return reply(200, { students: profiles.filter(p => p.role === 'student'), attempts, challenges });
     }
     if (action === 'create-student') {
+      requireAdmin();
       const name = String(body.name || '').trim();
       const code = String(body.code || '').trim().toLowerCase();
       if (name.length < 2 || name.length > 120 || !codePattern.test(code)) throw new ApiError(400, 'أدخلي اسمًا ورمزًا بالإنجليزية من 3 إلى 40 حرفًا يبدأ بحرف.');
       if (typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) throw new ApiError(400, 'كلمة المرور المؤقتة يجب أن تكون 10 أحرف على الأقل.');
-      const duplicate = await request(`/rest/v1/profiles?code=eq.${encodeURIComponent(code)}&select=id`);
+      const duplicate = await db(`/rest/v1/profiles?code=eq.${encodeURIComponent(code)}&select=id`);
       if (duplicate.length) throw new ApiError(409, 'رمز الطالبة مستخدم مسبقًا.');
-      const created = await request('/auth/v1/admin/users', { method: 'POST', data: { email: loginEmail(code), password: body.password, email_confirm: true } });
+      const created = await request('/auth/v1/admin/users', { method: 'POST', admin: true, data: { email: loginEmail(code), password: body.password, email_confirm: true } });
       try {
-        await request('/rest/v1/profiles', { method: 'POST', data: { id: created.id, name, code, role: 'student', must_change_password: true } });
+        await request('/rest/v1/profiles', { method: 'POST', admin: true, data: { id: created.id, name, code, role: 'student', must_change_password: true } });
       } catch (e) {
-        await request(`/auth/v1/admin/users/${created.id}`, { method: 'DELETE' }).catch(() => {});
+        await request(`/auth/v1/admin/users/${created.id}`, { method: 'DELETE', admin: true }).catch(() => {});
         throw e;
       }
       return reply(201, { ok: true });
     }
     if (action === 'reset-password') {
+      requireAdmin();
       if (!uuid(body.studentId) || typeof body.password !== 'string' || body.password.length < 10 || body.password.length > 128) throw new ApiError(400, 'بيانات استعادة الحساب غير صحيحة.');
-      const [student] = await request(`/rest/v1/profiles?id=eq.${body.studentId}&role=eq.student&select=id`);
+      const [student] = await db(`/rest/v1/profiles?id=eq.${body.studentId}&role=eq.student&select=id`);
       if (!student) throw new ApiError(404, 'لم يتم العثور على الطالبة.');
-      await request(`/auth/v1/admin/users/${student.id}`, { method: 'PUT', data: { password: body.password } });
-      await request(`/rest/v1/profiles?id=eq.${student.id}`, { method: 'PATCH', data: { must_change_password: true } });
+      await request(`/auth/v1/admin/users/${student.id}`, { method: 'PUT', admin: true, data: { password: body.password } });
+      await request(`/rest/v1/profiles?id=eq.${student.id}`, { method: 'PATCH', admin: true, data: { must_change_password: true } });
       return reply(200, { ok: true });
     }
     throw new ApiError(400, 'العملية غير معروفة.');
